@@ -68,12 +68,14 @@ def to_uop(buf:LazyBuffer, ctx:ScheduleContext, children:DefaultDict[UOp, Dict[U
   if buf.op is Ops.CONST:
     if isinstance(val:=buf.arg, UOp): ctx.var_vals.update([val.unbind()])
     return UOp(Ops.VALID, dtypes.bool, (buf.st.to_uop(),)).where(UOp.const(dtype, val), 0)
-  # everything else has BUFFER
-  ctx.buf_uops.setdefault(ubuf:=UOp.new_buffer((b:=buf.buffer).device, b.size, b.dtype, num=len(ctx.buf_uops)), b)
   # if the buffer is already realized we just load it
-  if buf.is_realized(): return UOp(Ops.VIEW, dtype, (ubuf,), buf.st)
+  if buf.is_realized():
+    ctx.buf_uops[ubuf:=UOp.new_buffer((b:=buf.buffer).device, b.size, b.dtype, num=len(ctx.buf_uops))] = buf.buffer
+    return cache.setdefault(buf, UOp(Ops.VIEW, dtype, (ubuf,), buf.st))
   # everything else needs sources
   src = tuple(to_uop(x, ctx, children, allbufs, double_reduces, cache) for x in buf.srcs)
+  if buf.op is Ops.ASSIGN: ubuf = src[0].buf_uop
+  else: ctx.buf_uops[ubuf:=UOp.new_buffer((b:=buf.buffer).device, b.size, b.dtype, num=len(ctx.buf_uops))] = buf.buffer
   if buf.op in {Ops.REDUCE_AXIS, Ops.CONTIGUOUS}: ret = UOp(buf.op, dtype, src, buf.arg)
   elif buf.op is Ops.ASSIGN:
     ctx.assigns.add(ubuf)
@@ -83,7 +85,7 @@ def to_uop(buf:LazyBuffer, ctx:ScheduleContext, children:DefaultDict[UOp, Dict[U
   if buf.forced_realize: ret = UOp(Ops.CONTIGUOUS, dtype, (ret,))
   cache[buf] = ret = UOp(Ops.VIEW, dtype, (ubuf, ret), buf.st)
   if buf.metadata is not None: ctx.ubuf_metadata[ubuf] = buf.metadata
-  ctx.lazybufs[b] = buf
+  ctx.lazybufs[buf.buffer] = buf
   # things for fuse.py
   allbufs[ubuf] = ret
   if buf.op is Ops.REDUCE_AXIS and buf.srcs[0].base.op is buf.op and buf.srcs[0] is not buf.srcs[0].base: double_reduces[ubuf] = None
