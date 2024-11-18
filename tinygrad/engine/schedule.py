@@ -44,7 +44,6 @@ def is_scheduled(u:UOp): return u.op is Ops.VIEW and len(u.src) == 2
 @dataclass(frozen=True)
 class ScheduleContext:
   ubuf_metadata: Dict[UOp, Metadata] = field(default_factory=dict)   # this maps BUFFER uops to Metadata
-  var_vals: Dict[Variable, int] = field(default_factory=dict)        # this maps a BIND's DEFINE_VAR to its value
   assigns: Set[UOp] = field(default_factory=set)                     # this holds all the BUFFER uops we ASSIGN to in this schedule
   allbufs: Dict[UOp, UOp] = field(default_factory=dict)              # this maps BUFFER uops the actual op
   children: DefaultDict[UOp, Dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
@@ -64,9 +63,7 @@ def to_uop(buf:LazyBuffer, ctx:ScheduleContext, buffers:Dict[UOp, Buffer], lazyb
     buf.buffer.options = None
   dtype = buf.dtype if buf.op in GroupOp.Meta else buf.dtype.base
   # consts are always fused and generated
-  if buf.op is Ops.CONST:
-    if isinstance(val:=buf.arg, UOp): ctx.var_vals.update([val.unbind()])
-    return UOp(Ops.VALID, dtypes.bool, (buf.st.to_uop(),)).where(UOp.const(dtype, val), 0)
+  if buf.op is Ops.CONST: return UOp(Ops.VALID, dtypes.bool, (buf.st.to_uop(),)).where(v if isinstance(v:=buf.arg, UOp) else UOp.const(dtype, v), 0)
   # everything else is a VIEW of BUFFER (with an optional op)
   if buf.is_realized:
     buffers[ubuf:=UOp.new_buffer((b:=buf.buffer).device, b.size, b.dtype, num=len(buffers))] = buf.buffer
@@ -186,8 +183,13 @@ def _append_preload(ctx:ScheduleItemContext, x:UOp, b:UOp) -> UOp:
   if b in ctx.assigned: ctx.assign_preloads.append(b)
   return x.replace(op=Ops.LOAD)
 
+def _append_bind(ctx:ScheduleItemContext, x:UOp) -> UOp:
+  ctx.var_vals.update([ret:=x.unbind()])
+  return ret[0]
+
 to_si = PatternMatcher([
   (UPat(Ops.VIEW, name="x"), _append_st_vars),
+  (UPat(Ops.BIND, name="x"), _append_bind),
   (UPat(Ops.PRELOAD, src=(UPat.var("b"), UPat()), name="x"), _append_preload),
   (UPat(Ops.SINK, src=(UPat.store(UPat.var("b"), UPat(), UPat(GroupOp.Meta, name="x")),)), lambda ctx,b,x: x.replace(src=(b, *x.src))),
 ])
@@ -378,9 +380,10 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   sinks = [UOp.sink(*(realizes[u] for u in stores)) for stores in store_groups]
   # preschedule all realizes
   prescheduled: List[ScheduleItem] = []
+  var_vals: Dict[Variable, int] = {}
   for sink in sinks:
     metadata = tuple({mx for x in sink.sparents if (x.op is Ops.STORE or is_scheduled(x)) and (mx:=ctx.ubuf_metadata.get(x.buf_uop))})
-    ast, ast_ctx = full_ast_rewrite(sink, ctx.var_vals, ctx.assigns)
+    ast, ast_ctx = full_ast_rewrite(sink, var_vals, ctx.assigns)
     prescheduled.append(ScheduleItem(ast, tuple(b for u in ast_ctx.bufs if (b:=buffers[u]).size != 0), metadata, tuple(ast_ctx.assign_preloads)))
   # do BFS
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
@@ -411,7 +414,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   # confirm everything was scheduled correctly
   if len(schedule) != (groups:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
-  return schedule, ctx.var_vals
+  return schedule, var_vals
 
 def create_schedule(outs:List[LazyBuffer]) -> List[ScheduleItem]:
   schedule, var_vals = create_schedule_with_vars(outs)
