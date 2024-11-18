@@ -184,8 +184,14 @@ def _append_preload(ctx:ScheduleItemContext, x:UOp, b:UOp) -> UOp:
   if b in ctx.assigned: ctx.assign_preloads.append(b)
   return x.replace(op=Ops.LOAD)
 
+def _append_bind(ctx:ScheduleItemContext, x:UOp) -> UOp:
+  ret, val = x.unbind()
+  ctx.var_vals[ret] = val
+  return ret
+
 to_si = PatternMatcher([
   (UPat(Ops.VIEW, name="x"), _append_st_vars),
+  (UPat(Ops.BIND, name="x"), _append_bind),
   (UPat(Ops.PRELOAD, src=(UPat.var("b"), UPat()), name="x"), _append_preload),
   (UPat(Ops.SINK, src=(UPat.store(UPat.var("b"), UPat(), UPat(GroupOp.Meta, name="x")),)), lambda ctx,b,x: x.replace(src=(b, *x.src))),
 ])
