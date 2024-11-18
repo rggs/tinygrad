@@ -44,7 +44,6 @@ def is_scheduled(u:UOp): return u.op is Ops.VIEW and len(u.src) == 2
 @dataclass(frozen=True)
 class ScheduleContext:
   ubuf_metadata: Dict[UOp, Metadata] = field(default_factory=dict)   # this maps BUFFER uops to Metadata
-  var_vals: Dict[Variable, int] = field(default_factory=dict)        # this maps a BIND's DEFINE_VAR to its value
   assigns: Set[UOp] = field(default_factory=set)                     # this holds all the BUFFER uops we ASSIGN to in this schedule
   allbufs: Dict[UOp, UOp] = field(default_factory=dict)              # this maps BUFFER uops the actual op
   children: DefaultDict[UOp, Dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
@@ -206,7 +205,7 @@ lazy = PatternMatcher([
 
 multioutput = PatternMatcher([(UPat.load(UPat.var("b"), UPat()), lambda ctx,b: ctx.get(b)),])
 
-def full_ast_rewrite(pre:UOp, var_vals:Dict[Variable, int], assigned:Set[UOp]) -> Tuple[UOp, ScheduleItemContext]:
+def full_ast_rewrite(pre:UOp, assigned:Set[UOp]) -> Tuple[UOp, ScheduleItemContext]:
   # fuse and fold store -> loads
   sink = graph_rewrite(pre, lazy+multioutput if len(pre.src)>1 else lazy, {x.buf_uop:x.src[2] for x in pre.src})
   # assert cyclic dependency
@@ -222,8 +221,8 @@ def full_ast_rewrite(pre:UOp, var_vals:Dict[Variable, int], assigned:Set[UOp]) -
       raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
                          +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
   # convert to AST
-  sink = graph_rewrite(graph_rewrite(sink, to_si, ctx:=ScheduleItemContext(var_vals, assigned)), append_bufs, ctx)
-  if getenv("RUN_PROCESS_REPLAY"): PROCESS_REPLAY_CAPTURE.append(((pre, var_vals, assigned), sink))
+  sink = graph_rewrite(graph_rewrite(sink, to_si, ctx:=ScheduleItemContext({}, assigned)), append_bufs, ctx)
+  if getenv("RUN_PROCESS_REPLAY"): PROCESS_REPLAY_CAPTURE.append(((pre, assigned), sink))
   return sink, ctx
 
 PROCESS_REPLAY_CAPTURE: List[Tuple[Tuple, UOp]] = []
@@ -382,10 +381,12 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   sinks = [UOp.sink(*(realizes[u] for u in stores)) for stores in store_groups]
   # preschedule all realizes
   prescheduled: List[ScheduleItem] = []
+  var_vals: Dict[Variable, int] = {}
   for sink in sinks:
     metadata = tuple({mx for x in sink.sparents if (x.op is Ops.STORE or is_scheduled(x)) and (mx:=ctx.ubuf_metadata.get(x.buf_uop))})
-    ast, ast_ctx = full_ast_rewrite(sink, ctx.var_vals, ctx.assigns)
+    ast, ast_ctx = full_ast_rewrite(sink, ctx.assigns)
     prescheduled.append(ScheduleItem(ast, tuple(b for u in ast_ctx.bufs if (b:=buffers[u]).size != 0), metadata, tuple(ast_ctx.assign_preloads)))
+    var_vals.update(ast_ctx.var_vals)
   # do BFS
   schedule_targets = {out:si for si in prescheduled for out in si.outputs}
   graph: DefaultDict[ScheduleItem, List[ScheduleItem]] = defaultdict(list)
@@ -415,7 +416,7 @@ def create_schedule_with_vars(outs:List[LazyBuffer]) -> Tuple[List[ScheduleItem]
   # confirm everything was scheduled correctly
   if len(schedule) != (groups:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
-  return schedule, ctx.var_vals
+  return schedule, var_vals
 
 def create_schedule(outs:List[LazyBuffer]) -> List[ScheduleItem]:
   schedule, var_vals = create_schedule_with_vars(outs)
